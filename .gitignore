@@ -1,0 +1,4 @@
+work/
+dist/
+*.qcow2
+*.raw
