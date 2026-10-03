@@ -1,0 +1,215 @@
+name: Build Debian Cloud Image
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      debian_release:
+        description: 'Debian 版本：all = 10/11/12/13 全部构建'
+        type: choice
+        options:
+          - all
+          - trixie
+          - bookworm
+          - bullseye
+          - buster
+        default: all
+      boot_mode:
+        description: '引导方式：both = BIOS+UEFI 通用（默认），bios / uefi = 单一模式。阿里云导入时「启动模式」需与之一致。'
+        type: choice
+        options:
+          - both
+          - bios
+          - uefi
+        default: both
+      ssh_pubkey:
+        description: '注入镜像的 SSH 公钥（root 与 debian 用户都会写入）。填 none 则不注入任何公钥。'
+        required: false
+        default: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMvW/cDO0A5pLlIC0WD4jr586MYoxhcXvpvVX3evkOJv debian'
+      password:
+        description: '同时为 root 与 debian 用户设置的登录密码，留空则不设置任何密码。'
+        required: false
+        default: ''
+      disk_size:
+        description: '镜像虚拟磁盘大小，默认 1G（实例系统盘会被 cloud-init 自动扩容）'
+        required: false
+        default: '1G'
+      cloud_init:
+        description: '是否安装 cloud-init：yes = 支持实例创建时注入密钥/主机名（默认）；no = 省约 60MB，但绑定密钥对不再生效，密钥必须在构建时烤进镜像'
+        type: choice
+        options:
+          - yes
+          - no
+        default: yes
+      release_tag:
+        description: '要创建或更新的 Release tag，留空则使用 manual-<run number>'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-debian-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: 计算构建矩阵
+        id: matrix
+        env:
+          RELEASE_INPUT: ${{ inputs.debian_release }}
+        run: |
+          set -euo pipefail
+          rel="${RELEASE_INPUT:-all}"
+          case "${rel}" in
+            all) list="buster bullseye bookworm trixie" ;;
+            buster|bullseye|bookworm|trixie) list="${rel}" ;;
+            *) echo "错误：debian_release 只能是 all/trixie/bookworm/bullseye/buster，当前为 ${rel}"; exit 1 ;;
+          esac
+          json='{"include":['
+          sep=''
+          for r in ${list}; do
+            json="${json}${sep}{\"release\":\"${r}\"}"
+            sep=','
+          done
+          json="${json}]}"
+          echo "matrix=${json}" >> "${GITHUB_OUTPUT}"
+          echo "构建矩阵：${json}"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: 校验输入并准备构建参数
+        env:
+          BOOT_MODE: ${{ inputs.boot_mode || 'both' }}
+          SSH_PUBKEY: ${{ inputs.ssh_pubkey || 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMvW/cDO0A5pLlIC0WD4jr586MYoxhcXvpvVX3evkOJv debian' }}
+          SSH_PASSWORD: ${{ inputs.password }}
+          DISK_SIZE: ${{ inputs.disk_size || '1G' }}
+        run: |
+          set -euo pipefail
+
+          case "${BOOT_MODE}" in
+            both|bios|uefi) ;;
+            *) echo "错误：boot_mode 只能是 both / bios / uefi，当前为 ${BOOT_MODE}"; exit 1 ;;
+          esac
+          echo "引导方式：${BOOT_MODE}"
+
+          if [ "$(printf '%s' "${SSH_PUBKEY}" | tr '[:upper:]' '[:lower:]')" = "none" ]; then
+            : > /tmp/build-ssh-pubkey
+            echo "ssh_pubkey=none：本次构建不注入任何公钥"
+          else
+            if [ "$(printf '%s' "${SSH_PUBKEY}" | wc -l)" -ne 0 ]; then
+              echo "错误：SSH 公钥不能包含换行符"; exit 1
+            fi
+            if ! printf '%s' "${SSH_PUBKEY}" | grep -qE '^(ssh-rsa|ssh-dss|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}( [^[:space:]]+)?$'; then
+              echo "错误：SSH_PUBKEY 不是有效的 OpenSSH 公钥：${SSH_PUBKEY}"; exit 1
+            fi
+            printf '%s\n' "${SSH_PUBKEY}" > /tmp/build-ssh-pubkey
+            echo "将注入的公钥：${SSH_PUBKEY}"
+          fi
+
+          : > /tmp/build-password
+          if [ -n "${SSH_PASSWORD}" ]; then
+            echo "::add-mask::${SSH_PASSWORD}"
+            printf '%s' "${SSH_PASSWORD}" > /tmp/build-password
+            echo "将为 root 与 debian 设置同一个登录密码"
+          else
+            echo "未设置密码：root 与 debian 保持无密码状态"
+          fi
+          chmod 600 /tmp/build-password /tmp/build-ssh-pubkey
+
+          echo "磁盘大小：${DISK_SIZE}"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: 安装构建工具
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            debootstrap debian-archive-keyring gdisk parted \
+            dosfstools e2fsprogs util-linux qemu-utils xz-utils curl
+
+      - name: 构建 Debian ${{ matrix.release }} 镜像
+        id: build
+        env:
+          DEBIAN_RELEASE: ${{ matrix.release }}
+          BOOT_MODE: ${{ inputs.boot_mode || 'both' }}
+          DISK_SIZE: ${{ inputs.disk_size || '1G' }}
+          CLOUD_INIT: ${{ inputs.cloud_init || 'yes' }}
+        run: |
+          set -euxo pipefail
+          sudo env "PATH=${PATH}" \
+            DEBIAN_RELEASE="${DEBIAN_RELEASE}" \
+            BOOT_MODE="${BOOT_MODE}" \
+            DISK_SIZE="${DISK_SIZE}" \
+            CLOUD_INIT="${CLOUD_INIT}" \
+            GITHUB_OUTPUT="${GITHUB_OUTPUT}" \
+            bash scripts/build-image.sh
+          cat "${GITHUB_OUTPUT}"
+
+      - name: 上传镜像 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: debian-custom-${{ matrix.release }}
+          path: dist/*.qcow2
+          retention-days: 14
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 下载全部镜像 artifact
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 发布 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          BOOT_MODE: ${{ inputs.boot_mode || 'both' }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euxo pipefail
+          ls -lh dist
+
+          case "${BOOT_MODE}" in
+            both) BOOT_LABEL=bios-uefi ;;
+            *)    BOOT_LABEL="${BOOT_MODE}" ;;
+          esac
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            BASE_TAG="${GITHUB_REF_NAME}"
+          else
+            BASE_TAG="${INPUT_RELEASE_TAG}"
+            [ -n "${BASE_TAG}" ] || BASE_TAG="manual-${GITHUB_RUN_NUMBER}"
+          fi
+          TAG_NAME="${BASE_TAG}-${BOOT_LABEL}"
+          echo "准备发布 Tag: ${TAG_NAME}"
+
+          NOTES="自动发布的 Debian 阿里云优化镜像（debootstrap 最小化构建，${BOOT_LABEL} 引导）。包含镜像：$(ls dist | tr '\n' ' ')"
+
+          if ! gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release create "${TAG_NAME}" \
+              --title "Custom Debian Cloud Image ${TAG_NAME}" \
+              --notes "${NOTES}"
+          fi
+
+          gh release upload "${TAG_NAME}" dist/*.qcow2 --clobber
+          gh release edit "${TAG_NAME}" --latest

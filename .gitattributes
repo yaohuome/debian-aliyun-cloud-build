@@ -1,0 +1,5 @@
+# 统一使用 LF，避免 Windows 上编辑后 bash 脚本无法执行
+* text=auto eol=lf
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
